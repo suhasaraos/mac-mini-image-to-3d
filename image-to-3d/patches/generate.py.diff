@@ -1,0 +1,81 @@
+diff --git a/generate.py b/generate.py
+index b3f6718..c102111 100644
+--- a/generate.py
++++ b/generate.py
+@@ -63,6 +63,19 @@ def main():
+         "--steps", type=int, default=None,
+         help="Override sampler steps for all three flow phases (default: pipeline JSON, usually 12)",
+     )
++    parser.add_argument(
++        "--rembg", default="ZhengPeng7/BiRefNet",
++        help="Background-removal weights (default: ZhengPeng7/BiRefNet, MIT). "
++             "TRELLIS's own default, briaai/RMBG-2.0, is non-commercial.",
++    )
++    parser.add_argument(
++        "--extra-views", nargs="*", default=[],
++        help="More photos of the same object from other angles (e.g. the far side)",
++    )
++    parser.add_argument(
++        "--main-weight", type=float, default=0.5,
++        help="Share of the main image in the multi-view average (default 0.5)",
++    )
+     args = parser.parse_args()
+ 
+     if not os.path.exists(args.image):
+@@ -77,6 +90,16 @@ def main():
+     print("\nLoading pipeline...")
+     t0 = time.time()
+     from trellis2.pipelines.trellis2_image_to_3d import Trellis2ImageTo3DPipeline
++    from trellis2.pipelines import rembg as rembg_module
++
++    # pipeline.json names briaai/RMBG-2.0 (non-commercial); swap in the weights from --rembg.
++    _BiRefNet = rembg_module.BiRefNet
++    class _SwappedBiRefNet(_BiRefNet):
++        def __init__(self, model_name: str = args.rembg, **kw):
++            super().__init__(model_name=args.rembg, **kw)
++            self.model.float()  # ZhengPeng7 weights ship in fp16; the wrapper feeds fp32 images
++    rembg_module.BiRefNet = _SwappedBiRefNet
++    print(f"Background removal: {args.rembg}")
+ 
+     pipeline = Trellis2ImageTo3DPipeline.from_pretrained("microsoft/TRELLIS.2-4B")
+     print(f"Loaded in {time.time() - t0:.0f}s")
+@@ -89,6 +112,39 @@ def main():
+     img = PILImage.open(args.image)
+     print(f"Input: {args.image} ({img.size[0]}x{img.size[1]})")
+ 
++    # Extra views (e.g. the hidden inner side): encode each view separately and average the
++    # flow model's prediction across views at every sampling step ("multidiffusion", the
++    # multi-image mode of the original TRELLIS). Without it, a single photo leaves the hidden
++    # side to guesswork, and symmetric-looking objects get mirrored details.
++    if args.extra_views:
++        from trellis2.pipelines.samplers.flow_euler import FlowEulerSampler
++
++        class MultiCond(list):
++            pass
++
++        views = [pipeline.preprocess_image(PILImage.open(p)) for p in args.extra_views]
++        weights = [args.main_weight] + [(1 - args.main_weight) / len(views)] * len(views)
++        _get_cond = pipeline.get_cond
++
++        def get_cond_multi(image, resolution, include_neg_cond=True):
++            conds = [_get_cond(image, resolution, include_neg_cond)["cond"]]
++            conds += [_get_cond([v], resolution, include_neg_cond)["cond"] for v in views]
++            out = {"cond": MultiCond(conds)}
++            if include_neg_cond:
++                out["neg_cond"] = torch.zeros_like(conds[0])
++            return out
++
++        _infer = FlowEulerSampler._inference_model
++
++        def infer_multi(self, model, x_t, t, cond=None, **kw):
++            if isinstance(cond, MultiCond):
++                return sum(w * _infer(self, model, x_t, t, c, **kw) for w, c in zip(weights, cond))
++            return _infer(self, model, x_t, t, cond, **kw)
++
++        pipeline.get_cond = get_cond_multi
++        FlowEulerSampler._inference_model = infer_multi
++        print(f"Extra views: {', '.join(args.extra_views)} (main view weight {args.main_weight})")
++
+     # Generate
+     print(f"\nGenerating 3D model (pipeline={args.pipeline_type}, seed={args.seed})...")
+     t0 = time.time()
